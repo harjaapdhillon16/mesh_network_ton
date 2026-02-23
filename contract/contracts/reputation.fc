@@ -1,0 +1,259 @@
+;; MESH Reputation Registry (FunC)
+;; Storage layout:
+;;   owner_wc:int8
+;;   owner_hash:uint256
+;;   reputation_map: dict<uint256, int64>
+;;   stake_map: dict<uint256, coins>
+;;   stake_since_map: dict<uint256, uint64>
+;;   tx_seen: dict<uint256, uint1>
+
+#include "imports/stdlib.fc";
+
+int OP_REGISTER() { return 0x01; }
+int OP_RECORD_OUTCOME() { return 0x02; }
+int OP_SLASH() { return 0x03; }
+int OP_WITHDRAW_STAKE() { return 0x04; }
+
+int ERR_UNKNOWN_OP() { return 101; }
+int ERR_MIN_STAKE() { return 100; }
+int ERR_NOT_OWNER() { return 401; }
+int ERR_REPLAY() { return 402; }
+int ERR_NOT_REGISTERED() { return 403; }
+int ERR_BAD_RATING() { return 404; }
+int ERR_BAD_ADDR() { return 405; }
+
+int KEY_LEN() { return 256; }
+int MIN_STAKE() { return 1000000000; } ;; 1 TON
+int INITIAL_REPUTATION() { return 100; }
+
+int rep_delta_for_rating(int rating) inline {
+  if (rating >= 9) { return 15; }
+  if (rating >= 7) { return 8; }
+  if (rating >= 5) { return 2; }
+  if (rating >= 3) { return -10; }
+  return -25;
+}
+
+int clamp_non_negative(int x) inline {
+  if (x < 0) { return 0; }
+  return x;
+}
+
+(int, int, cell, cell, cell, cell) load_state() inline {
+  var ds = get_data().begin_parse();
+  var owner_wc = ds~load_int(8);
+  var owner_hash = ds~load_uint(256);
+  var rep_dict = ds~load_dict();
+  var stake_dict = ds~load_dict();
+  var since_dict = ds~load_dict();
+  var tx_seen = ds~load_dict();
+  return (owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+}
+
+() save_state(int owner_wc, int owner_hash, cell rep_dict, cell stake_dict, cell since_dict, cell tx_seen) impure inline {
+  set_data(
+    begin_cell()
+      .store_int(owner_wc, 8)
+      .store_uint(owner_hash, 256)
+      .store_dict(rep_dict)
+      .store_dict(stake_dict)
+      .store_dict(since_dict)
+      .store_dict(tx_seen)
+      .end_cell()
+  );
+}
+
+(int, int) addr_key(slice addr) inline {
+  return parse_std_addr(addr);
+}
+
+(int) dict_get_i64(cell dict, int key, int default_value) inline {
+  var (value_slice, ok) = udict_get?(dict, KEY_LEN(), key);
+  if (ok) {
+    return value_slice~load_int(64);
+  }
+  return default_value;
+}
+
+(int) dict_get_u64(cell dict, int key, int default_value) inline {
+  var (value_slice, ok) = udict_get?(dict, KEY_LEN(), key);
+  if (ok) {
+    return value_slice~load_uint(64);
+  }
+  return default_value;
+}
+
+(int) dict_get_coins(cell dict, int key, int default_value) inline {
+  var (value_slice, ok) = udict_get?(dict, KEY_LEN(), key);
+  if (ok) {
+    return value_slice~load_coins();
+  }
+  return default_value;
+}
+
+(int) dict_has_key(cell dict, int key) inline {
+  var (_, ok) = udict_get?(dict, KEY_LEN(), key);
+  return ok;
+}
+
+cell dict_set_i64(cell dict, int key, int value) inline {
+  return udict_set_builder(dict, KEY_LEN(), key, begin_cell().store_int(value, 64));
+}
+
+cell dict_set_u64(cell dict, int key, int value) inline {
+  return udict_set_builder(dict, KEY_LEN(), key, begin_cell().store_uint(value, 64));
+}
+
+cell dict_set_coins(cell dict, int key, int value) inline {
+  return udict_set_builder(dict, KEY_LEN(), key, begin_cell().store_coins(value));
+}
+
+cell dict_set_bool1(cell dict, int key, int value) inline {
+  return udict_set_builder(dict, KEY_LEN(), key, begin_cell().store_uint(value, 1));
+}
+
+cell dict_delete_key(cell dict, int key) inline {
+  var (next, _) = udict_delete?(dict, KEY_LEN(), key);
+  return next;
+}
+
+() send_refund(slice to, int amount) impure inline {
+  if (amount <= 0) {
+    return ();
+  }
+
+  var msg = begin_cell()
+    .store_uint(0x10, 6) ;; int_msg_info$0 + ihr_disabled + bounce=0 + bounced=0 + src=addr_none
+    .store_slice(to)
+    .store_coins(amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .end_cell();
+  send_raw_message(msg, 1);
+}
+
+() handle_register(int msg_value, int sender_key, int owner_wc, int owner_hash, cell rep_dict, cell stake_dict, cell since_dict, cell tx_seen) impure inline {
+  var current_stake = dict_get_coins(stake_dict, sender_key, 0);
+  if (current_stake == 0) {
+    throw_unless(ERR_MIN_STAKE(), msg_value >= MIN_STAKE());
+    rep_dict = dict_set_i64(rep_dict, sender_key, INITIAL_REPUTATION());
+    since_dict = dict_set_u64(since_dict, sender_key, now());
+  }
+
+  stake_dict = dict_set_coins(stake_dict, sender_key, current_stake + msg_value);
+  save_state(owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+}
+
+() handle_record_outcome(slice body, int owner_wc, int owner_hash, cell rep_dict, cell stake_dict, cell since_dict, cell tx_seen) impure inline {
+  var tx_hash = body~load_uint(256);
+  var executor_addr = body~load_msg_addr();
+  var rating = body~load_uint(8);
+  throw_unless(ERR_BAD_RATING(), (rating >= 1) & (rating <= 10));
+
+  throw_unless(ERR_REPLAY(), dict_has_key(tx_seen, tx_hash) == 0);
+
+  var (_, executor_key) = parse_std_addr(executor_addr);
+  var stake = dict_get_coins(stake_dict, executor_key, 0);
+  throw_unless(ERR_NOT_REGISTERED(), stake > 0);
+
+  var current_rep = dict_get_i64(rep_dict, executor_key, INITIAL_REPUTATION());
+  var next_rep = clamp_non_negative(current_rep + rep_delta_for_rating(rating));
+
+  rep_dict = dict_set_i64(rep_dict, executor_key, next_rep);
+  tx_seen = dict_set_bool1(tx_seen, tx_hash, 1);
+
+  save_state(owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+}
+
+() handle_slash(slice body, int owner_wc, int owner_hash, cell rep_dict, cell stake_dict, cell since_dict, cell tx_seen) impure inline {
+  var offender_addr = body~load_msg_addr();
+  var (_, offender_key) = parse_std_addr(offender_addr);
+
+  var stake = dict_get_coins(stake_dict, offender_key, 0);
+  throw_unless(ERR_NOT_REGISTERED(), stake > 0);
+  var rep = dict_get_i64(rep_dict, offender_key, INITIAL_REPUTATION());
+
+  var slash_amt = stake / 5; ;; 20%
+  var next_stake = stake - slash_amt;
+  var next_rep = clamp_non_negative(rep - 50);
+
+  stake_dict = dict_set_coins(stake_dict, offender_key, next_stake);
+  rep_dict = dict_set_i64(rep_dict, offender_key, next_rep);
+
+  save_state(owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+}
+
+() handle_withdraw(slice sender_addr, int sender_key, int owner_wc, int owner_hash, cell rep_dict, cell stake_dict, cell since_dict, cell tx_seen) impure inline {
+  var amount = dict_get_coins(stake_dict, sender_key, 0);
+  throw_unless(ERR_NOT_REGISTERED(), amount > 0);
+
+  stake_dict = dict_delete_key(stake_dict, sender_key);
+  rep_dict = dict_delete_key(rep_dict, sender_key);
+  since_dict = dict_delete_key(since_dict, sender_key);
+
+  save_state(owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+  send_refund(sender_addr, amount);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  var (owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen) = load_state();
+  var cs = in_msg_full.begin_parse();
+  var flags = cs~load_uint(4);
+  var sender_addr = cs~load_msg_addr();
+  var (sender_wc, sender_hash) = parse_std_addr(sender_addr);
+
+  ;; Ignore bounced messages.
+  if ((flags & 1) != 0) {
+    return ();
+  }
+
+  var op = in_msg_body~load_uint(32);
+  var _query_id = in_msg_body~load_uint(64);
+
+  if (op == OP_REGISTER()) {
+    handle_register(msg_value, sender_hash, owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+    return ();
+  }
+
+  if (op == OP_RECORD_OUTCOME()) {
+    handle_record_outcome(in_msg_body, owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+    return ();
+  }
+
+  if (op == OP_SLASH()) {
+    throw_unless(ERR_NOT_OWNER(), sender_wc == owner_wc);
+    throw_unless(ERR_NOT_OWNER(), sender_hash == owner_hash);
+    handle_slash(in_msg_body, owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+    return ();
+  }
+
+  if (op == OP_WITHDRAW_STAKE()) {
+    handle_withdraw(sender_addr, sender_hash, owner_wc, owner_hash, rep_dict, stake_dict, since_dict, tx_seen);
+    return ();
+  }
+
+  throw(ERR_UNKNOWN_OP());
+}
+
+int get_reputation(slice addr) method_id {
+  var (_, _, rep_dict, _, _, _) = load_state();
+  var (_, key) = addr_key(addr);
+  return dict_get_i64(rep_dict, key, 0);
+}
+
+(int, int) get_stake(slice addr) method_id {
+  var (_, _, _, stake_dict, since_dict, _) = load_state();
+  var (_, key) = addr_key(addr);
+  return (
+    dict_get_coins(stake_dict, key, 0),
+    dict_get_u64(since_dict, key, 0)
+  );
+}
+
+(int, int) get_owner() method_id {
+  var (owner_wc, owner_hash, _, _, _, _) = load_state();
+  return (owner_wc, owner_hash);
+}

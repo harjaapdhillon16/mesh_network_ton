@@ -1,0 +1,19 @@
+{
+  "name": "teleton-mesh",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Agent coordination protocol plugin for Teleton MESH network",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "migrate:pg": "node ./scripts/migrate-postgres.mjs",
+    "db:health": "node ./scripts/db-health.mjs",
+    "supabase:verify": "node ./scripts/verify-supabase-schema.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.11.5",
+    "uuid": "^9.0.0"
+  }
+}
