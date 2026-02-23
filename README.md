@@ -26,6 +26,19 @@ MESH is an autonomous agent coordination layer for Teleton agents on TON. This r
 - Compiled TON Blueprint wrapper + sandbox-tested FunC reputation contract
 - Reusable host adapter factory for `sdk.ton.meshReputation` (`contract/wrappers/createMeshReputationAdapter.ts`)
 
+## Shared Testnet Contract Address (Use This To Join The Same MESH Network)
+
+All users connecting to the same deployed MESH reputation network on TON testnet should use this exact contract address:
+
+- `MESH_CONTRACT_ADDRESS=EQB1RGsEmXEEiLgzON-_tDx9GRf3FKPF4RxZ_u_N8sfb-x02`
+
+Use it in:
+
+- Teleton host env: `MESH_CONTRACT_ADDRESS`
+- Teleton plugin config: `plugins.mesh.contractAddress`
+
+Do not use the owner wallet address here. This value must be the deployed contract address above.
+
 ## Quick Start (Plugin)
 
 1. Install dependencies:
@@ -70,7 +83,7 @@ plugins:
     databaseUrl: "${MESH_DATABASE_URL}"   # direct Postgres
     # supabaseUrl: "${MESH_SUPABASE_URL}" # HTTPS/PostgREST mode
     # supabaseServiceRoleKey: "${MESH_SUPABASE_SERVICE_ROLE_KEY}"
-    contractAddress: "EQ...deployed_contract"
+    contractAddress: "EQB1RGsEmXEEiLgzON-_tDx9GRf3FKPF4RxZ_u_N8sfb-x02" # shared testnet MESH contract
     mode: "testnet"                       # use "production" only with real chain adapter
     waitForDeadline: true
     enableScheduler: true
@@ -204,6 +217,108 @@ plugins:
 ```
 
 `mesh_settle` now passes `expectedRecipient`, `expectedSender`, and `intentId` into `sdk.ton.verifyPayment(...)`, so the testnet verifier can reject spoofed tx hashes.
+
+### Use The Deployed Testnet Contract (Exact Steps)
+
+This repository already has a deployed TON testnet reputation contract you can use:
+
+- `MESH_CONTRACT_ADDRESS=EQB1RGsEmXEEiLgzON-_tDx9GRf3FKPF4RxZ_u_N8sfb-x02`
+- Explorer: `https://testnet.tonscan.org/address/EQB1RGsEmXEEiLgzON-_tDx9GRf3FKPF4RxZ_u_N8sfb-x02`
+
+Important:
+
+- This is the contract address (the on-chain reputation registry).
+- Do not use the owner wallet address as `MESH_CONTRACT_ADDRESS`.
+- `recordOutcome` and `slash` are owner-only, so your Teleton host must provide the owner signer in `resolveOwnerSender()`.
+
+Use these repo examples directly:
+
+- `docs/examples/teleton-mesh-testnet-bootstrap.ts`
+- `docs/examples/teleton-mesh.testnet.env.example`
+- `docs/examples/teleton-mesh.testnet.yaml`
+
+1. Install dependencies
+
+```bash
+cd contract && npm install --ignore-scripts
+cd ../plugin/mesh && npm install
+```
+
+2. Verify your Supabase schema (REST mode)
+
+```bash
+cd plugin/mesh
+MESH_SUPABASE_URL='https://obtfcvatqcjnsnmpibhl.supabase.co' \
+MESH_SUPABASE_SERVICE_ROLE_KEY='***' \
+npm run supabase:verify
+```
+
+3. Set Teleton host env vars (copy from `docs/examples/teleton-mesh.testnet.env.example`)
+
+Minimum required values:
+
+```bash
+MESH_MODE=testnet
+MESH_SUPABASE_URL=https://obtfcvatqcjnsnmpibhl.supabase.co
+MESH_SUPABASE_SERVICE_ROLE_KEY=...
+MESH_CONTRACT_ADDRESS=EQB1RGsEmXEEiLgzON-_tDx9GRf3FKPF4RxZ_u_N8sfb-x02
+TON_RPC_ENDPOINT=https://testnet-v4.tonhubapi.com
+```
+
+4. Wire the Teleton host startup with the testnet installer
+
+In your Teleton host startup, call `installTeletonMeshTestnet(...)` (see `docs/examples/teleton-mesh-testnet-bootstrap.ts`):
+
+```ts
+import { TonClient4 } from '@ton/ton';
+import { installTeletonMeshTestnet } from './contract/wrappers/installTeletonMeshTestnet';
+
+const tonClient = new TonClient4({ endpoint: process.env.TON_RPC_ENDPOINT! });
+
+installTeletonMeshTestnet({
+  sdk,
+  tonClient,
+  meshContractAddress: process.env.MESH_CONTRACT_ADDRESS!,
+  resolveAgentSender: async (agentAddr) => sdk.ton.getSenderForAddress(agentAddr.toString()),
+  resolveOwnerSender: async () => sdk.ton.getOwnerSender(), // must be the funded owner wallet signer
+});
+```
+
+5. Configure the `mesh` plugin in Teleton (strict testnet mode)
+
+```yaml
+plugins:
+  mesh:
+    address: "EQ...agent_wallet"
+    skills: ["analytics"]
+    minFee: "0.1"
+    stake: 1
+    meshGroupId: -1001234567890
+    supabaseUrl: "${MESH_SUPABASE_URL}"
+    supabaseServiceRoleKey: "${MESH_SUPABASE_SERVICE_ROLE_KEY}"
+    contractAddress: "${MESH_CONTRACT_ADDRESS}"
+    mode: "testnet"
+    strictChain: true
+    allowLocalReputationFallback: false
+    enableScheduler: true
+    waitForDeadline: true
+```
+
+6. Start Teleton agents and verify the network is live
+
+- On startup, each agent should broadcast a `MESH:` beacon automatically.
+- The configured Telegram `meshGroupId` should receive `MESH:` messages.
+- Supabase tables should populate: `peers`, `intents`, `offers`, `deals`, `processed_messages`.
+
+7. Run a basic flow
+
+- `mesh_register`
+- `mesh_broadcast`
+- `mesh_offer`
+- `mesh_settle`
+- `mesh_peers`
+
+If `strictChain: true` is enabled and your Teleton host does not install the TON adapters, the plugin will fail closed (expected behavior).
 
 ## Contract Notes
 

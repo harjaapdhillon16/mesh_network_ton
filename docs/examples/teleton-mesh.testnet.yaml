@@ -1,0 +1,28 @@
+plugins:
+  mesh:
+    address: "EQ...agent_wallet"
+    skills: ["analytics"]
+    minFee: "0.1"
+    stake: 1
+    meshGroupId: -1001234567890
+
+    # Storage (Supabase REST mode, IPv4-safe)
+    supabaseUrl: "${MESH_SUPABASE_URL}"
+    supabaseServiceRoleKey: "${MESH_SUPABASE_SERVICE_ROLE_KEY}"
+
+    # Live TON testnet contract (already deployed)
+    contractAddress: "${MESH_CONTRACT_ADDRESS}"
+    mode: "testnet"
+
+    # Fail closed if chain adapter/payment verifier is missing
+    strictChain: true
+    allowLocalReputationFallback: false
+
+    # Scheduler + routing behavior
+    autoRegisterOnStart: true
+    waitForDeadline: true
+    enableScheduler: true
+    schedulerIntervalMs: 1000
+    sendRetries: 2
+    sendRetryBaseMs: 150
+
